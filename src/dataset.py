@@ -1,8 +1,10 @@
 import cv2
 from pathlib import Path
 import matplotlib.pyplot as plt
+import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
+RESULTS_DIR = PROJECT_ROOT / "results"
 
 
 def load_image(sequence: str, frame: int):
@@ -11,23 +13,38 @@ def load_image(sequence: str, frame: int):
     return image
 
 
-img = load_image("00", 500)
+img0 = load_image("00", 0)
+img1 = load_image("00", 1)
+
 orb = cv2.ORB_create(nfeatures=500)
-keypoints, descriptors = orb.detectAndCompute(img, None)
+kps0, des0 = orb.detectAndCompute(img0, None)
+kps1, des1 = orb.detectAndCompute(img1, None)
 
-kp = keypoints[0]
+kp = kps0[0]
 
-print(kp.pt)
-print(kp.angle)
-print(kp.size)
+img0_with_kp = cv2.drawKeypoints(
+    img0, kps0, None, color=(0, 255, 0), flags=0)
 
-print(descriptors.shape)
-print(descriptors.dtype)
-print(descriptors[0])
 
-img_with_kp = cv2.drawKeypoints(
-    img, keypoints, None, color=(0, 255, 0), flags=0)
-plt.imshow(img_with_kp)
-plt.title("ORB Keypoints")
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+matches = bf.knnMatch(des0, des1, k=2)
+# for i in np.arange(0.6, 1.0, 0.05):
+#     good_matches = []
+#     # best < threshold * second_best
+#     for pair in matches:
+#         if pair[0].distance < i * pair[1].distance:
+#             good_matches.append(pair[0])
+#     print(f'{i}: {len(good_matches)}')
+good_matches = []
+threshold = 0.75
+# best < threshold * second_best
+for pair in matches:
+    if pair[0].distance < threshold * pair[1].distance:
+        good_matches.append(pair[0])
+print(f'{threshold}: {len(good_matches)}')
+res = cv2.drawMatches(img0, kps0, img1, kps1, good_matches, None, flags=2)
+cv2.imwrite(str(RESULTS_DIR / "orb_matches.png"), res)
+plt.imshow(res)
+plt.title("ORB Matches")
 plt.axis('off')
 plt.show()
