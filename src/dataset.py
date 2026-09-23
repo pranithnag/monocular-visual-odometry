@@ -6,7 +6,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 RESULTS_DIR = PROJECT_ROOT / "results"
 
-
 def load_image(sequence: str, frame: int):
     image = cv2.imread(
         str(DATA_DIR / "sequences" / sequence / "image_0" / f"{frame:06d}.png"), cv2.IMREAD_GRAYSCALE)
@@ -131,15 +130,15 @@ truth_positions = np.array([pose[:, 3] for pose in gt_poses[:len(estimated_posit
 position_errors = np.linalg.norm(estimated_positions - truth_positions, axis=1)
 position_rmse = np.sqrt(np.mean(position_errors ** 2))
 
-plt.plot(errors)
+# plt.plot(errors)
 
-plt.xlabel("Frame")
-plt.ylabel("Position Error (m)")
-plt.title("Visual Odometry Position Error")
-plt.grid()
+# plt.xlabel("Frame")
+# plt.ylabel("Position Error (m)")
+# plt.title("Visual Odometry Position Error")
+# plt.grid()
 
-plt.savefig("results/position_error.png")
-plt.show()
+# plt.savefig("results/position_error.png")
+# plt.show()
 fig, ax = plt.subplots(figsize=(9, 7))
 ax.plot(truth_positions[:, 0], truth_positions[:, 2],
         label="KITTI ground truth", color="tab:blue", linewidth=2)
@@ -153,4 +152,5 @@ ax.axis("equal")
 ax.grid(alpha=0.3)
 ax.legend()
 fig.tight_layout()
+plt.savefig("results/vo_truth_comparison.png")
 plt.show()
