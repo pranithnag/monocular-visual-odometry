@@ -2,6 +2,54 @@ import cv2
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
+from dataclasses import dataclass
+from tqdm import tqdm
+import time
+
+
+@dataclass
+class FrameResult:
+    frame: int
+    position: np.ndarray
+    position_error: float
+    good_matches: int | None = None
+    essential_inliers: int | None = None
+    pose_inliers: int | None = None
+    inlier_ratio: float | None = None
+    processing_time: float | None = None
+
+
+@dataclass
+class VOResult:
+    method: str
+    frames: list[FrameResult]
+
+    @property
+    def trajectory(self):
+        return np.array([frame.position for frame in self.frames])
+
+    @property
+    def errors(self):
+        return np.array([frame.position_error for frame in self.frames])
+
+    @property
+    def processing_times(self):
+        return np.array(
+            [
+                frame.processing_time
+                for frame in self.frames
+                if frame.processing_time is not None
+            ]
+        )
+
+    @property
+    def mean_processing_time(self):
+        return np.mean(self.processing_times)
+
+    @property
+    def fps(self):
+        return 1 / self.mean_processing_time
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
@@ -35,13 +83,18 @@ def load_ground_truth(sequence: str):
     return poses
 
 
-def estimate_motion(img0, img1, K, return_debug=False):
-    orb = cv2.ORB_create(nfeatures=3000)
+def estimate_motion(img0, img1, K, method="ORB", return_debug=False):
+    if method == "ORB":
+        detector = cv2.ORB_create(nfeatures=3000)
+    elif method == "SIFT":
+        detector = cv2.SIFT_create(nfeatures=3000)
 
-    kps0, des0 = orb.detectAndCompute(img0, None)
-    kps1, des1 = orb.detectAndCompute(img1, None)
-
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    kps0, des0 = detector.detectAndCompute(img0, None)
+    kps1, des1 = detector.detectAndCompute(img1, None)
+    norm = cv2.NORM_L2
+    if method == "ORB":
+        norm = cv2.NORM_HAMMING
+    bf = cv2.BFMatcher(norm, crossCheck=False)
     matches = bf.knnMatch(des0, des1, k=2)
 
     good_matches = []
@@ -95,142 +148,227 @@ gt_poses = load_ground_truth("00")
 scale = get_scale(gt_poses, 0)
 # print(f"Ground truth scale: {scale}")
 # R, t, inliers = estimate_motion(img0, img1, K)
-R_global = np.eye(3)
-t_global = np.zeros((3, 1))
-trajectory = []
+
 good_match_counts = []
 essential_inlier_counts = []
 pose_inlier_counts = []
 position_errors = []
-for frame in range(100):
-    img0 = load_image("00", frame)
-    img1 = load_image("00", frame + 1)
-    result = estimate_motion(img0, img1, K)
-    R = result["R"]
-    t = result["t"]
-    good_matches = result["good_match_count"]
-    essential_inliers = result["ransac_inliers"]
-    pose_inliers = result["pose_inliers"]
-    good_match_counts.append(good_matches)
-    essential_inlier_counts.append(essential_inliers)
-    pose_inlier_counts.append(pose_inliers)
-    scale = get_scale(gt_poses, frame)
-    print(f"Frame {frame}: scale={scale}")
-    # if scale > 0.1:
-    R_relative_inv = R.T
-    t_relative_inv = -R.T @ t
 
-    t_global = t_global + scale * (R_global @ t_relative_inv)
-    R_global = R_global @ R_relative_inv
-    print(f"Global translation:\n{t_global.flatten()}")
-    print(f"Truth translation:\n{gt_poses[frame + 1][:, 3]}")
-    print("\n")
-    trajectory.append(t_global.flatten())
-    position_errors.append(
-        np.linalg.norm(t_global.flatten() - gt_poses[frame + 1][:, 3])
+
+def run_vo(method):
+    R_global = np.eye(3)
+    t_global = np.zeros((3, 1))
+
+    frames = [
+        FrameResult(
+            frame=0,
+            position=np.zeros(3),
+            position_error=0.0,
+        )
+    ]
+
+    for frame in tqdm(range(100), desc=f"Running {method} VO"):
+        img0 = load_image("00", frame)
+        img1 = load_image("00", frame + 1)
+        start = time.perf_counter()
+        result = estimate_motion(img0, img1, K, method=method)
+        elapsed = time.perf_counter() - start
+        R = result["R"]
+        t = result["t"]
+
+        good_matches = result["good_match_count"]
+        essential_inliers = result["ransac_inliers"]
+        pose_inliers = result["pose_inliers"]
+
+        scale = get_scale(gt_poses, frame)
+
+        R_relative_inv = R.T
+        t_relative_inv = -R.T @ t
+
+        t_global = t_global + scale * (R_global @ t_relative_inv)
+
+        R_global = R_global @ R_relative_inv
+
+        position = t_global.flatten().copy()
+
+        truth_position = gt_poses[frame + 1][:, 3]
+
+        error = np.linalg.norm(position - truth_position)
+
+        frames.append(
+            FrameResult(
+                frame=frame + 1,
+                position=position,
+                position_error=error,
+                good_matches=good_matches,
+                essential_inliers=essential_inliers,
+                pose_inliers=pose_inliers,
+                inlier_ratio=essential_inliers / good_matches,
+                processing_time=elapsed,
+            )
+        )
+
+    return VOResult(method=method, frames=frames)
+
+
+orb_results = run_vo("ORB")
+sift_results = run_vo("SIFT")
+
+# Extract X and Z positions
+orb_x = orb_results.trajectory[:, 0]
+orb_z = orb_results.trajectory[:, 2]
+
+sift_x = sift_results.trajectory[:, 0]
+sift_z = sift_results.trajectory[:, 2]
+
+# Ground truth positions corresponding to frames 0 -> 100
+truth_positions = np.array([pose[:, 3] for pose in gt_poses[: len(orb_results.frames)]])
+
+truth_x = truth_positions[:, 0]
+truth_z = truth_positions[:, 2]
+
+
+# Calculate position errors for ORB and SIFT
+orb_position_errors = np.linalg.norm(orb_results.trajectory - truth_positions, axis=1)
+sift_position_errors = np.linalg.norm(sift_results.trajectory - truth_positions, axis=1)
+
+orb_error_increase = np.diff(orb_position_errors)
+sift_error_increase = np.diff(sift_position_errors)
+
+worst_frames = np.argsort(orb_error_increase)[-5:]
+for frame in worst_frames:
+    print(f"Worst Frame: {frame} -> {frame + 1}")
+    print(f"ORB Good Matches: {orb_results.frames[frame].good_matches}")
+    print(f"ORB Essential Inliers: {orb_results.frames[frame].essential_inliers}")
+    print(
+        f"ORB Translation Direction: {orb_results.trajectory[frame + 1] - orb_results.trajectory[frame]}"
     )
-inlier_ratios = []
+    print("--------------------------------------------------")
+    print(f"SIFT Good Matches: {sift_results.frames[frame].good_matches}")
+    print(f"SIFT Essential Inliers: {sift_results.frames[frame].essential_inliers}")
+    print(
+        f"SIFT Translation Direction: {sift_results.trajectory[frame + 1] - sift_results.trajectory[frame]}"
+    )
+    print("--------------------------------------------------")
+worst_frame_orb = worst_frames[-1]
+sift_position_errors = np.linalg.norm(sift_results.trajectory - truth_positions, axis=1)
 
-for i in range(len(good_match_counts)):
-    ratio = essential_inlier_counts[i] / good_match_counts[i]
-    inlier_ratios.append(ratio)
-worst = np.argmin(inlier_ratios)
-print(f"Worst transition: {worst} -> {worst + 1}", inlier_ratios[worst])
-max_delta_error_frame = 0
-max_delta_error = 0
-for frame in range(len(position_errors)):
-    prev_error = position_errors[frame - 1] if frame > 0 else 0
-    error = position_errors[frame]
-    delta_error = error - prev_error
-    if delta_error > max_delta_error:
-        max_delta_error_frame = frame
-        max_delta_error = delta_error
-print("Largest error increase:", max_delta_error)
-print("Occurred at frame:", max_delta_error_frame)
-worst_frame = max_delta_error_frame
+orb_rmse = np.sqrt(np.mean(orb_position_errors**2))
+sift_rmse = np.sqrt(np.mean(sift_position_errors**2))
 
-img0 = load_image("00", worst_frame)
-img1 = load_image("00", worst_frame + 1)
+# ============================================================
+# TRAJECTORY COMPARISON
+# ============================================================
 
-result = estimate_motion(img0, img1, K)
+fig, ax = plt.subplots(figsize=(9, 7))
 
-kps0 = result["kps0"]
-kps1 = result["kps1"]
-good_matches = result["good_matches"]
-mask = result["mask"]
-
-
-res = cv2.drawMatches(
-    img0,
-    kps0,
-    img1,
-    kps1,
-    good_matches,
-    None,
-    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
+ax.plot(
+    truth_x,
+    truth_z,
+    label="KITTI Ground Truth",
+    linewidth=2,
 )
-cv2.imwrite(str(RESULTS_DIR / f"failure_frame_{worst_frame}_matches.png"), res)
-plt.imshow(res)
-plt.title(f"Failure Frame {worst_frame} -> {worst_frame + 1} Matches")
-plt.axis("off")
-matches_mask = mask.ravel().astype(int).tolist()
-res = cv2.drawMatches(
-    img0,
-    kps0,
-    img1,
-    kps1,
-    good_matches,
-    None,
-    matchesMask=matches_mask,
-    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
+
+ax.plot(
+    orb_x,
+    orb_z,
+    label="ORB VO + GT Step Magnitudes",
+    linewidth=1.5,
 )
-cv2.imwrite(str(RESULTS_DIR / f"failure_frame_{worst_frame}_inliers.png"), res)
-plt.imshow(res)
-plt.title(f"Failure Frame {worst_frame} -> {worst_frame + 1} Inliers")
-plt.axis("off")
-# plt.plot(essential_inlier_counts, label="Essential Matrix Inliers")
-# plt.xlabel("Frame")
-# plt.ylabel("Essential Matrix Inliers")
-# plt.savefig("results/essential_inliers.png")
-# errors = []
-# for frame in range(len(trajectory)):
-#     estimated_position = trajectory[frame]
-#     truth_position = gt_poses[frame + 1][:, 3]
-#     error = np.linalg.norm(estimated_position - truth_position)
-#     errors.append(error)
-# Include frame 0 and select the same frames for both plotted trajectories.
-estimated_positions = np.vstack([np.zeros(3), np.asarray(trajectory)])
-truth_positions = np.array(
-    [pose[:, 3] for pose in gt_poses[: len(estimated_positions)]]
+
+ax.plot(
+    sift_x,
+    sift_z,
+    label="SIFT VO + GT Step Magnitudes",
+    linewidth=1.5,
 )
-position_errors = np.linalg.norm(estimated_positions - truth_positions, axis=1)
-position_rmse = np.sqrt(np.mean(position_errors**2))
 
-# plt.plot(errors)
+ax.scatter(
+    [0],
+    [0],
+    marker="o",
+    label="Frame 0 Origin",
+)
 
-# plt.xlabel("Frame")
-# plt.ylabel("Position Error (m)")
-# plt.title("Visual Odometry Position Error")
-# plt.grid()
+ax.set(
+    xlabel="X in Camera 0 Frame (m)",
+    ylabel="Z in Camera 0 Frame (m)",
+    title=(
+        f"KITTI 00 Monocular Visual Odometry\n"
+        f"ORB RMSE: {orb_rmse:.3f} m | "
+        f"SIFT RMSE: {sift_rmse:.3f} m"
+    ),
+)
 
-# plt.savefig("results/position_error.png")
-# plt.show()
-# fig, ax = plt.subplots(figsize=(9, 7))
-# ax.plot(truth_positions[:, 0], truth_positions[:, 2],
-#         label="KITTI ground truth", color="tab:blue", linewidth=2)
-# ax.plot(estimated_positions[:, 0], estimated_positions[:, 2],
-#         label="ORB VO + GT step magnitudes", color="tab:orange", linewidth=1.5)
-# ax.scatter([0], [0], marker="o", color="black", label="Shared frame 0 origin")
-# ax.set(xlabel="X in camera 0 frame (m)", ylabel="Z in camera 0 frame (m)",
-#        title=f"KITTI 00 image_0 | {len(trajectory)} transitions / {len(estimated_positions)} positions\n"
-#              f"3D position RMSE {position_rmse:.3f} m; endpoint {position_errors[-1]:.3f} m")
-# ax.axis("equal")
-# ax.grid(alpha=0.3)
-# ax.legend()
-# fig.tight_layout()
-# plt.savefig("results/vo_truth_comparison.png")
-print("Final Position Error:", position_errors[-1])
-print("Mean Position Error:", np.mean(position_errors))
-print("Mean Good Matches:", np.mean(good_match_counts))
-print("Mean Inlier Ratio:", np.mean(inlier_ratios))
-# plt.show()
+ax.axis("equal")
+ax.grid(alpha=0.3)
+ax.legend()
+
+fig.tight_layout()
+
+plt.savefig(
+    RESULTS_DIR / "orb_vs_sift_trajectory.png",
+    dpi=300,
+)
+
+plt.close(fig)
+
+
+# ============================================================
+# POSITION ERROR COMPARISON
+# ============================================================
+
+fig, ax = plt.subplots(figsize=(9, 5))
+
+ax.plot(
+    orb_position_errors,
+    label="ORB",
+)
+
+ax.plot(
+    sift_position_errors,
+    label="SIFT",
+)
+
+ax.set(
+    xlabel="Frame",
+    ylabel="Position Error (m)",
+    title="ORB vs SIFT Position Error",
+)
+
+ax.grid(alpha=0.3)
+ax.legend()
+
+fig.tight_layout()
+
+plt.savefig(
+    RESULTS_DIR / "orb_vs_sift_position_error.png",
+    dpi=300,
+)
+
+plt.close(fig)
+
+
+# ============================================================
+# RESULTS
+# ============================================================
+
+print("\nORB")
+print("Final Position Error:", orb_position_errors[-1])
+print("Mean Position Error:", np.mean(orb_position_errors))
+print("Position RMSE:", orb_rmse)
+print(
+    f"ORB: {orb_results.mean_processing_time * 1000:.2f} ms/frame "
+    f"({orb_results.fps:.2f} FPS)"
+)
+print(f"FPS: {orb_results.fps:.2f}")
+
+print("\nSIFT")
+print("Final Position Error:", sift_position_errors[-1])
+print("Mean Position Error:", np.mean(sift_position_errors))
+print("Position RMSE:", sift_rmse)
+print(
+    f"SIFT: {sift_results.mean_processing_time * 1000:.2f} ms/frame "
+    f"({sift_results.fps:.2f} FPS)"
+)
+print(f"FPS: {sift_results.fps:.2f}")
