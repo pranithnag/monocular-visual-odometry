@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import time
 
+cv2.setRNGSeed(0)
+cv2.setNumThreads(1)
+
 
 @dataclass
 class FrameResult:
@@ -16,7 +19,10 @@ class FrameResult:
     essential_inliers: int | None = None
     pose_inliers: int | None = None
     inlier_ratio: float | None = None
+    pose_inlier_ratio: float | None = None
     processing_time: float | None = None
+    quality_score: float | None = None
+    accepted: bool | None = None
 
 
 @dataclass
@@ -49,6 +55,18 @@ class VOResult:
     @property
     def fps(self):
         return 1 / self.mean_processing_time
+
+    @property
+    def rmse(self):
+        return np.sqrt(np.mean(self.errors**2))
+
+    @property
+    def mean_error(self):
+        return np.mean(self.errors)
+
+    @property
+    def final_error(self):
+        return self.errors[-1]
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -137,9 +155,31 @@ def get_scale(gt_poses, frame):
     scale = np.linalg.norm(difference)
     return scale
 
+def rotation_angle(R):
+    cos_angle = (np.trace(R) - 1) / 2
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    return np.degrees(np.arccos(cos_angle))
+def is_motion_valid(result):
+    good_matches = result["good_match_count"]
+    essential_inliers = result["ransac_inliers"]
+    pose_inliers = result["pose_inliers"]
 
-cv2.setRNGSeed(0)
-cv2.setNumThreads(1)
+    if good_matches == 0:
+        return False
+
+    essential_ratio = essential_inliers / good_matches
+    pose_ratio = pose_inliers / good_matches
+    if good_matches < 1000:
+        return False
+
+    if essential_ratio < 0.9:
+        return False
+
+    if pose_ratio < 0.8:
+        return False
+
+    return True
+
 
 img0 = load_image("00", 0)
 img1 = load_image("00", 1)
@@ -155,7 +195,7 @@ pose_inlier_counts = []
 position_errors = []
 
 
-def run_vo(method):
+def run_vo(method, num_frames=100, reject_outliers=False):
     R_global = np.eye(3)
     t_global = np.zeros((3, 1))
 
@@ -166,8 +206,8 @@ def run_vo(method):
             position_error=0.0,
         )
     ]
-
-    for frame in tqdm(range(100), desc=f"Running {method} VO"):
+    previous_displacement = None
+    for frame in tqdm(range(num_frames), desc=f"Running {method} VO"):
         img0 = load_image("00", frame)
         img1 = load_image("00", frame + 1)
         start = time.perf_counter()
@@ -184,11 +224,22 @@ def run_vo(method):
 
         R_relative_inv = R.T
         t_relative_inv = -R.T @ t
+        valid = is_motion_valid(result)
+        displacement = scale * (R_global @ t_relative_inv)
 
-        t_global = t_global + scale * (R_global @ t_relative_inv)
+        if not reject_outliers or valid:
+            t_global += displacement
 
-        R_global = R_global @ R_relative_inv
-
+            R_global = R_global @ R_relative_inv
+            angle = rotation_angle(R_relative_inv)
+            if angle > 5:
+                print(
+                    f"{frame} -> {frame + 1}: "
+                    f"rotation = {angle:.2f}°"
+                )
+            previous_displacement = displacement.copy()
+        # elif previous_displacement is not None:
+        #     t_global += previous_displacement
         position = t_global.flatten().copy()
 
         truth_position = gt_poses[frame + 1][:, 3]
@@ -204,57 +255,122 @@ def run_vo(method):
                 essential_inliers=essential_inliers,
                 pose_inliers=pose_inliers,
                 inlier_ratio=essential_inliers / good_matches,
+                pose_inlier_ratio=pose_inliers / good_matches,
                 processing_time=elapsed,
+                quality_score=calculate_quality_score(
+                    good_matches, essential_inliers, pose_inliers
+                ),
+                accepted=valid,
             )
         )
 
     return VOResult(method=method, frames=frames)
 
 
-orb_results = run_vo("ORB")
-sift_results = run_vo("SIFT")
+def calculate_quality_score(
+    good_matches,
+    ransac_inliers,
+    pose_inliers,
+):
+    if good_matches == 0:
+        return 0.0
 
-# Extract X and Z positions
-orb_x = orb_results.trajectory[:, 0]
-orb_z = orb_results.trajectory[:, 2]
+    match_score = min(good_matches / 1000.0, 1.0)
 
+    essential_ratio = ransac_inliers / good_matches
+    pose_ratio = pose_inliers / good_matches
+
+    quality_score = 0.2 * match_score + 0.4 * essential_ratio + 0.4 * pose_ratio
+
+    return quality_score
+
+
+sift_results = run_vo("SIFT", num_frames=10, reject_outliers=False)
+frame = 540
+
+img0 = load_image("00", frame)
+img1 = load_image("00", frame + 1)
+
+result = estimate_motion(img0, img1, K, method="SIFT")
+
+print("Good matches:", result["good_match_count"])
+print("RANSAC inliers:", result["ransac_inliers"])
+print("Pose inliers:", result["pose_inliers"])
+
+print(
+    "RANSAC ratio:",
+    result["ransac_inliers"] / result["good_match_count"]
+)
+
+print(
+    "Pose ratio:",
+    result["pose_inliers"] / result["good_match_count"]
+)
+
+print("R:")
+print(result["R"])
+
+print("t:")
+print(result["t"].flatten())
+
+def log_results(vo_results, method_name):
+    print(f"\n{method_name} Results:")
+    print("Final Position Error:", vo_results.errors[-1])
+    print("Mean Position Error:", np.mean(vo_results.errors))
+    print("Position RMSE:", np.sqrt(np.mean(vo_results.errors**2)))
+    print(
+        f"{method_name}: {vo_results.mean_processing_time * 1000:.2f} ms/frame "
+        f"({vo_results.fps:.2f} FPS)"
+    )
+    print(
+        f"Mean Inlier Ratio: {np.mean([frame.inlier_ratio for frame in vo_results.frames[1:]])}"
+    )
+    print(
+        f"Mean Good Matches: {np.mean([frame.good_matches for frame in vo_results.frames[1:] if frame.good_matches is not None])}"
+    )
+    print(f"FPS: {vo_results.fps:.2f}")
+
+
+log_results(sift_results, "SIFT")
 sift_x = sift_results.trajectory[:, 0]
 sift_z = sift_results.trajectory[:, 2]
 
 # Ground truth positions corresponding to frames 0 -> 100
-truth_positions = np.array([pose[:, 3] for pose in gt_poses[: len(orb_results.frames)]])
+truth_positions = np.array(
+    [pose[:, 3] for pose in gt_poses[: len(sift_results.frames)]]
+)
 
 truth_x = truth_positions[:, 0]
 truth_z = truth_positions[:, 2]
 
 
-# Calculate position errors for ORB and SIFT
-orb_position_errors = np.linalg.norm(orb_results.trajectory - truth_positions, axis=1)
+# Calculate position errors for SIFT
 sift_position_errors = np.linalg.norm(sift_results.trajectory - truth_positions, axis=1)
 
-orb_error_increase = np.diff(orb_position_errors)
 sift_error_increase = np.diff(sift_position_errors)
 
-worst_frames = np.argsort(orb_error_increase)[-5:]
-for frame in worst_frames:
-    print(f"Worst Frame: {frame} -> {frame + 1}")
-    print(f"ORB Good Matches: {orb_results.frames[frame].good_matches}")
-    print(f"ORB Essential Inliers: {orb_results.frames[frame].essential_inliers}")
-    print(
-        f"ORB Translation Direction: {orb_results.trajectory[frame + 1] - orb_results.trajectory[frame]}"
-    )
-    print("--------------------------------------------------")
-    print(f"SIFT Good Matches: {sift_results.frames[frame].good_matches}")
-    print(f"SIFT Essential Inliers: {sift_results.frames[frame].essential_inliers}")
-    print(
-        f"SIFT Translation Direction: {sift_results.trajectory[frame + 1] - sift_results.trajectory[frame]}"
-    )
-    print("--------------------------------------------------")
-worst_frame_orb = worst_frames[-1]
+worst_frames = np.argsort(sift_error_increase)[-5:]
+# for frame in worst_frames:
+# print(f"Worst Frame: {frame} -> {frame + 1}")
+# # print(f"ORB Good Matches: {orb_results.frames[frame].good_matches}")
+# # print(f"ORB Essential Inliers: {orb_results.frames[frame].essential_inliers}")
+# # print(
+# #     f"ORB Translation Direction: {orb_results.trajectory[frame + 1] - orb_results.trajectory[frame]}"
+# # )
+# print("--------------------------------------------------")
+# print(f"SIFT Good Matches: {sift_results.frames[frame].good_matches}")
+# print(f"SIFT Essential Inliers: {sift_results.frames[frame].essential_inliers}")
+# print(
+#     f"SIFT Translation Direction: {sift_results.trajectory[frame + 1] - sift_results.trajectory[frame]}"
+# )
+# print(f"SIFT Position Error Increase: {sift_error_increase[frame]}")
+# print(f"SIFT Quality Score: {sift_results.frames[frame].quality_score}")
+# print("--------------------------------------------------\n")
 sift_position_errors = np.linalg.norm(sift_results.trajectory - truth_positions, axis=1)
 
-orb_rmse = np.sqrt(np.mean(orb_position_errors**2))
 sift_rmse = np.sqrt(np.mean(sift_position_errors**2))
+ratios = np.array([frame.pose_inlier_ratio for frame in sift_results.frames[1:]])
+
 
 # ============================================================
 # TRAJECTORY COMPARISON
@@ -267,13 +383,6 @@ ax.plot(
     truth_z,
     label="KITTI Ground Truth",
     linewidth=2,
-)
-
-ax.plot(
-    orb_x,
-    orb_z,
-    label="ORB VO + GT Step Magnitudes",
-    linewidth=1.5,
 )
 
 ax.plot(
@@ -293,11 +402,7 @@ ax.scatter(
 ax.set(
     xlabel="X in Camera 0 Frame (m)",
     ylabel="Z in Camera 0 Frame (m)",
-    title=(
-        f"KITTI 00 Monocular Visual Odometry\n"
-        f"ORB RMSE: {orb_rmse:.3f} m | "
-        f"SIFT RMSE: {sift_rmse:.3f} m"
-    ),
+    title=(f"KITTI 00 Monocular Visual Odometry\n" f"SIFT RMSE: {sift_rmse:.3f} m"),
 )
 
 ax.axis("equal")
@@ -307,7 +412,7 @@ ax.legend()
 fig.tight_layout()
 
 plt.savefig(
-    RESULTS_DIR / "orb_vs_sift_trajectory.png",
+    RESULTS_DIR / "final_trajectory.png",
     dpi=300,
 )
 
@@ -321,11 +426,6 @@ plt.close(fig)
 fig, ax = plt.subplots(figsize=(9, 5))
 
 ax.plot(
-    orb_position_errors,
-    label="ORB",
-)
-
-ax.plot(
     sift_position_errors,
     label="SIFT",
 )
@@ -333,7 +433,7 @@ ax.plot(
 ax.set(
     xlabel="Frame",
     ylabel="Position Error (m)",
-    title="ORB vs SIFT Position Error",
+    title="SIFT Position Error",
 )
 
 ax.grid(alpha=0.3)
@@ -342,7 +442,7 @@ ax.legend()
 fig.tight_layout()
 
 plt.savefig(
-    RESULTS_DIR / "orb_vs_sift_position_error.png",
+    RESULTS_DIR / "final_position_error.png",
     dpi=300,
 )
 
@@ -352,23 +452,22 @@ plt.close(fig)
 # ============================================================
 # RESULTS
 # ============================================================
+# rejected = [frame.frame for frame in orb_results.frames if frame.accepted is False]
+# print("Rejected frames:", rejected)
+# print("Number rejected:", len(rejected))
+# print("\nORB")
+# print("Final Position Error:", orb_position_errors[-1])
+# print("Mean Position Error:", np.mean(orb_position_errors))
+# print("Position RMSE:", orb_rmse)
+# print(
+#     f"ORB: {orb_results.mean_processing_time * 1000:.2f} ms/frame "
+#     f"({orb_results.fps:.2f} FPS)"
+# )
+# print(f"FPS: {orb_results.fps:.2f}")
 
-print("\nORB")
-print("Final Position Error:", orb_position_errors[-1])
-print("Mean Position Error:", np.mean(orb_position_errors))
-print("Position RMSE:", orb_rmse)
-print(
-    f"ORB: {orb_results.mean_processing_time * 1000:.2f} ms/frame "
-    f"({orb_results.fps:.2f} FPS)"
-)
-print(f"FPS: {orb_results.fps:.2f}")
-
-print("\nSIFT")
-print("Final Position Error:", sift_position_errors[-1])
-print("Mean Position Error:", np.mean(sift_position_errors))
-print("Position RMSE:", sift_rmse)
-print(
-    f"SIFT: {sift_results.mean_processing_time * 1000:.2f} ms/frame "
-    f"({sift_results.fps:.2f} FPS)"
-)
+print(f"Frames: {len(sift_results.frames) - 1}")
+print(f"RMSE: {sift_results.rmse:.3f} m")
+print(f"Mean error: {sift_results.mean_error:.3f} m")
+print(f"Final error: {sift_results.final_error:.3f} m")
+print(f"Mean processing time: {sift_results.mean_processing_time * 1000:.2f} ms")
 print(f"FPS: {sift_results.fps:.2f}")
